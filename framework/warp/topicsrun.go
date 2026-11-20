@@ -752,7 +752,7 @@ func (s *Service) readTopicWindow(ctx context.Context, config *schemas.WarpConfi
 	// Declared before reading. Indexing does this as it writes, but a process
 	// that has indexed nothing since it started has not, and stores that keep
 	// a namespace's dimension in memory cannot page it until it is.
-	if _, err := ensureWarpNamespace(ctx, s.vectorStore, namespace, config.EmbeddingDimension); err != nil {
+	if _, err := ensureWarpNamespace(ctx, s.vectorStore, namespace, config.EmbeddingDimension, s.markerLock); err != nil {
 		return fmt.Errorf("prepare log namespace: %w", err)
 	}
 	reader := &topicWindowReader{

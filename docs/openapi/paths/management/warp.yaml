@@ -152,8 +152,10 @@ warp-backfill-status:
         $ref: '../../openapi.yaml#/components/responses/InternalError'
       '503':
         description: |
-          The backfill job store is unavailable. This route does not need the job
-          runner: it only reads job state.
+          The backfill job store is unavailable, or, with no job in flight,
+          Warp's vector store could not be asked which store it is, so whether
+          the latest backfill indexed it cannot be told. This route does not
+          need the job runner: it only reads job state.
 
 warp-backfill-cancel:
   post:
@@ -192,6 +194,62 @@ warp-backfill-cancel:
           The background job runner or the backfill job store is unavailable.
           Cancelling needs both: the runner to stop the work, the store to record
           it.
+
+warp-left-behind-index:
+  get:
+    operationId: getWarpLeftBehindIndex
+    summary: Read the Warp log index left in the shared vector store
+    description: |
+      When Warp uses a store of its own (`warp.vector_store`), the log index it
+      built in the shared vector store before stays there. This reports it,
+      worked out from the stores on each call: the shared store still holds
+      Warp's namespace, and that namespace is not the one Warp writes to now.
+      `left_behind` is null when there is none, including while Warp uses the
+      shared store.
+
+      Administrators only: the local admin in OSS, `Warp` Update in enterprise.
+    tags: [Warp]
+    security:
+      - ManagementBearerAuth: []
+    responses:
+      '200':
+        description: The leftover index, or null
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/warp.yaml#/WarpLeftBehindIndexResponse'
+      '403':
+        description: Caller is not the local admin (OSS) and lacks `Warp` Update (enterprise)
+      '503':
+        description: The shared vector store could not be checked.
+
+warp-left-behind-index-delete:
+  post:
+    operationId: deleteWarpLeftBehindIndex
+    summary: Delete the Warp log index left in the shared vector store
+    description: |
+      Deletes Warp's namespace from the shared vector store, after checking
+      again that it is a leftover and not the index Warp writes to now. With
+      several replicas, call it only once every replica runs with
+      `warp.vector_store`.
+
+      Administrators only: the local admin in OSS, `Warp` Update in enterprise.
+    tags: [Warp]
+    security:
+      - ManagementBearerAuth: []
+    responses:
+      '200':
+        description: Deleted; there is no leftover now
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/warp.yaml#/WarpLeftBehindIndexResponse'
+      '403':
+        description: Caller is not the local admin (OSS) and lacks `Warp` Update (enterprise)
+      '404':
+        $ref: '../../openapi.yaml#/components/responses/NotFound'
+      '500':
+        $ref: '../../openapi.yaml#/components/responses/InternalError'
 
 warp-topics:
   post:

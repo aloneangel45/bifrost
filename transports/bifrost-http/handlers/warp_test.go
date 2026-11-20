@@ -59,8 +59,11 @@ func (handlerVectorStore) DeleteNamespace(context.Context, string) error { retur
 func (handlerVectorStore) ListNamespaces(context.Context, string) ([]string, error) {
 	return nil, nil
 }
+
+// GetChunk answers every lookup with one store marker: the store this fake
+// stands for is always the same one.
 func (handlerVectorStore) GetChunk(context.Context, string, string) (vectorstore.SearchResult, error) {
-	return vectorstore.SearchResult{}, nil
+	return vectorstore.SearchResult{Properties: map[string]interface{}{"warp_store_id": "handler-store"}}, nil
 }
 func (handlerVectorStore) GetChunks(context.Context, string, []string) ([]vectorstore.SearchResult, error) {
 	return nil, nil
@@ -81,15 +84,15 @@ func (handlerVectorStore) DeleteAll(context.Context, string, []vectorstore.Query
 }
 func (handlerVectorStore) Close(context.Context, string) error { return nil }
 
-func newBackfillTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, func()) {
+func newBackfillTestHandler(t *testing.T, extra ...warp.Option) (*WarpHandler, *fakeSidekiqStore, func()) {
 	t.Helper()
-	handler, jobs, _, cleanup := newTopicsTestHandler(t)
+	handler, jobs, _, cleanup := newTopicsTestHandler(t, extra...)
 	return handler, jobs, cleanup
 }
 
 // newTopicsTestHandler is newBackfillTestHandler with the log store the
 // topics live in, for a test that writes them.
-func newTopicsTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
+func newTopicsTestHandler(t *testing.T, extra ...warp.Option) (*WarpHandler, *fakeSidekiqStore, logstore.LogStore, func()) {
 	t.Helper()
 	topics := handlerTopicStore(t)
 	config := &recordingWarpStore{row: &tables.TableWarpConfig{
@@ -98,9 +101,10 @@ func newTopicsTestHandler(t *testing.T) (*WarpHandler, *fakeSidekiqStore, logsto
 	}}
 	jobs := newFakeSidekiqStore()
 	runner := sidekiq.New(jobs, &mockLogger{}, 1, "")
-	service := warp.NewService(nil, warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
+	opts := []warp.Option{warp.WithConfigStore(config), warp.WithLogReader(handlerBackfillReader{topics: topics}), warp.WithVectorStore(handlerVectorStore{}), warp.WithEmbeddingExecutor(func(_ *schemas.BifrostContext, _ *schemas.BifrostEmbeddingRequest) (*schemas.BifrostEmbeddingResponse, *schemas.BifrostError) {
 		return &schemas.BifrostEmbeddingResponse{Data: []schemas.EmbeddingData{{Embedding: schemas.EmbeddingStruct{EmbeddingArray: []float64{0, 1}}}}}, nil
-	}))
+	})}
+	service := warp.NewService(nil, append(opts, extra...)...)
 	service.RegisterBackfill(runner)
 	handler := &WarpHandler{service: service, sidekiqRunner: runner, backfillStore: jobs}
 	return handler, jobs, topics, func() { runner.Shutdown(); service.Shutdown() }
@@ -305,6 +309,37 @@ func TestWarpLogIndexStatusSummarisesState(t *testing.T) {
 	require.Contains(t, body, `"state":"indexing"`)
 	require.Contains(t, body, `"scanned":40`)
 	require.Contains(t, body, `"total":100`)
+}
+
+// markerUnreachableStore answers pings but cannot be asked for Warp's store
+// marker, as a store timing out on reads does.
+type markerUnreachableStore struct{ handlerVectorStore }
+
+func (markerUnreachableStore) GetChunk(context.Context, string, string) (vectorstore.SearchResult, error) {
+	return vectorstore.SearchResult{}, errors.New("marker read timed out")
+}
+
+// A store that cannot say which store it is does not match a finished backfill
+// from another store: the status page reports the failed check, and the tray
+// leaves the old run out of its summary, rather than showing a run from the
+// store Warp moved off as this one's.
+func TestWarpBackfillStatusDoesNotTakeAFailedStoreCheckForAMatch(t *testing.T) {
+	handler, jobs, cleanup := newBackfillTestHandler(t, warp.WithVectorStore(markerUnreachableStore{}),
+		warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "qdrant"}))
+	defer cleanup()
+	jobs.latest = &tables.TableSidekiqJob{ID: "job-old-store", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusFailed,
+		LastError: "old store failure", Metadata: `{"vector_store":"store-a","scanned":5,"total":5}`}
+
+	statusCtx := adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.NotContains(t, string(statusCtx.Response.Body()), "job-old-store", "the old store's run is not shown as this one's")
+	require.Equal(t, fasthttp.StatusServiceUnavailable, statusCtx.Response.StatusCode(), string(statusCtx.Response.Body()))
+
+	trayCtx := adminCtx("")
+	handler.logIndexStatus(trayCtx)
+	require.Equal(t, fasthttp.StatusOK, trayCtx.Response.StatusCode())
+	require.NotContains(t, string(trayCtx.Response.Body()), "old store failure")
+	require.Contains(t, string(trayCtx.Response.Body()), `"state":"ready"`)
 }
 
 // Topics are rows in the log store, so without one there is no run to start:
@@ -1452,4 +1487,164 @@ func TestWarpChatRefusesAModelThatIsNotExposed(t *testing.T) {
 	require.Equal(t, fasthttp.StatusBadRequest, ctx.Response.StatusCode())
 	require.Contains(t, string(ctx.Response.Body()), "model is not available for warp")
 	require.Empty(t, calls)
+}
+
+// Warp's own store failing at startup is reported as such: the save is refused
+// with the no_vector_store reason and a message naming the setting to fix, not
+// the generic "requires a connected vector store".
+func TestWarpConfigPutWithFailedDedicatedVectorStoreSaysWhy(t *testing.T) {
+	handler := &WarpHandler{service: warp.NewService(nil, warp.WithConfigStore(&recordingWarpStore{}),
+		warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "weaviate", Failed: true}))}
+	ctx := adminCtx(validWarpConfigJSON)
+	handler.putConfig(ctx)
+	require.Equal(t, fasthttp.StatusServiceUnavailable, ctx.Response.StatusCode())
+	body := string(ctx.Response.Body())
+	require.Contains(t, body, string(schemas.WarpUnavailableNoVectorStore))
+	require.Contains(t, body, "Warp's own vector store (warp.vector_store in config.json) could not be reached")
+
+	getCtx := adminCtx("")
+	handler.getConfig(getCtx)
+	require.Equal(t, fasthttp.StatusOK, getCtx.Response.StatusCode())
+	got := string(getCtx.Response.Body())
+	require.Contains(t, got, `"vector_store_dedicated":true`)
+	require.Contains(t, got, `"vector_store_type":"weaviate"`)
+	require.Contains(t, got, `"vector_store_failed":true`)
+}
+
+// After warp.vector_store is added or moved, a backfill that indexed into the
+// previous store says nothing about the new, empty one: the settings page and
+// the tray show no completed run, so the admin starts a backfill from the
+// existing button. A job into the store in use is still shown.
+func TestWarpBackfillStatusHidesJobFromAnotherVectorStore(t *testing.T) {
+	handler, jobs, cleanup := newBackfillTestHandler(t, warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "weaviate"}))
+	defer cleanup()
+	current, err := handler.service.BuildBackfillJobMeta(context.Background(), time.Unix(1, 0), time.Unix(2, 0), false)
+	require.NoError(t, err)
+	var meta warp.BackfillJobMeta
+	require.NoError(t, sonic.Unmarshal([]byte(current), &meta))
+	meta.VectorStore = ""
+	sharedStore, err := sonic.Marshal(meta)
+	require.NoError(t, err)
+	jobs.latest = &tables.TableSidekiqJob{ID: "job-shared-store", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusCompleted, Metadata: string(sharedStore)}
+
+	statusCtx := adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.Equal(t, fasthttp.StatusOK, statusCtx.Response.StatusCode())
+	require.Contains(t, string(statusCtx.Response.Body()), `"status":"idle"`)
+	require.NotContains(t, string(statusCtx.Response.Body()), "job-shared-store")
+	trayCtx := adminCtx("")
+	handler.logIndexStatus(trayCtx)
+	require.NotContains(t, string(trayCtx.Response.Body()), "job-shared-store")
+
+	jobs.latest.Metadata = current
+	statusCtx = adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.Contains(t, string(statusCtx.Response.Body()), `"id":"job-shared-store"`)
+	trayCtx = adminCtx("")
+	handler.logIndexStatus(trayCtx)
+	require.Contains(t, string(trayCtx.Response.Body()), `"id":"job-shared-store"`)
+}
+
+// sharedStoreWithLeftover is a shared store holding the index Warp built there
+// before it moved: Warp's namespace, with no live marker in it.
+type sharedStoreWithLeftover struct {
+	handlerVectorStore
+	deleted []string
+	gone    bool
+}
+
+func (s *sharedStoreWithLeftover) ListNamespaces(context.Context, string) ([]string, error) {
+	if s.gone {
+		return nil, nil
+	}
+	return []string{"WarpLogs"}, nil
+}
+
+func (s *sharedStoreWithLeftover) GetChunk(context.Context, string, string) (vectorstore.SearchResult, error) {
+	return vectorstore.SearchResult{}, vectorstore.ErrNotFound
+}
+
+func (s *sharedStoreWithLeftover) DeleteNamespace(_ context.Context, namespace string) error {
+	s.deleted = append(s.deleted, namespace)
+	s.gone = true
+	return nil
+}
+
+// On a store of its own, the settings page is told of the index Warp left in
+// the shared store and an admin deletes it through the router; afterwards
+// there is none, and a second delete is a 404. Others are refused.
+func TestWarpLeftoverIndexIsReportedAndDeleted(t *testing.T) {
+	shared := &sharedStoreWithLeftover{}
+	handler, _, cleanup := newBackfillTestHandler(t, warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "qdrant"}), warp.WithSharedVectorStore(shared))
+	defer cleanup()
+	r := router.New()
+	handler.RegisterRoutes(r)
+	call := func(ctx *fasthttp.RequestCtx, method, path string) *fasthttp.RequestCtx {
+		ctx.Request.Header.SetMethod(method)
+		ctx.Request.SetRequestURI(path)
+		r.Handler(ctx)
+		return ctx
+	}
+
+	got := call(adminCtx(""), "GET", "/api/warp/log-index/backfill/left-behind")
+	require.Equal(t, fasthttp.StatusOK, got.Response.StatusCode(), string(got.Response.Body()))
+	require.JSONEq(t, `{"left_behind":{"namespace":"WarpLogs"}}`, string(got.Response.Body()))
+
+	denied := call(requestCtx(), "POST", "/api/warp/log-index/backfill/left-behind/delete")
+	require.Equal(t, fasthttp.StatusForbidden, denied.Response.StatusCode())
+	require.Empty(t, shared.deleted)
+
+	deleted := call(adminCtx(""), "POST", "/api/warp/log-index/backfill/left-behind/delete")
+	require.Equal(t, fasthttp.StatusOK, deleted.Response.StatusCode(), string(deleted.Response.Body()))
+	require.Equal(t, []string{"WarpLogs"}, shared.deleted)
+
+	after := call(adminCtx(""), "GET", "/api/warp/log-index/backfill/left-behind")
+	require.JSONEq(t, `{"left_behind":null}`, string(after.Response.Body()))
+	again := call(adminCtx(""), "POST", "/api/warp/log-index/backfill/left-behind/delete")
+	require.Equal(t, fasthttp.StatusNotFound, again.Response.StatusCode())
+}
+
+// On the shared store there is nothing left behind to report, whatever the
+// shared store holds: its Warp namespace is the live index.
+func TestWarpLeftoverIndexIsNoneOnTheSharedStore(t *testing.T) {
+	shared := &sharedStoreWithLeftover{}
+	handler, _, cleanup := newBackfillTestHandler(t, warp.WithSharedVectorStore(shared))
+	defer cleanup()
+	ctx := adminCtx("")
+	handler.getLeftoverIndex(ctx)
+	require.JSONEq(t, `{"left_behind":null}`, string(ctx.Response.Body()))
+	del := adminCtx("")
+	handler.deleteLeftoverIndex(del)
+	require.Equal(t, fasthttp.StatusNotFound, del.Response.StatusCode())
+	require.Empty(t, shared.deleted)
+}
+
+// Starting a job when Warp's own store failed at startup says why the way a
+// save and a chat do: the 503 carries reason no_vector_store, which the
+// dashboard branches on.
+func TestWarpJobStartWithFailedDedicatedVectorStoreSaysWhy(t *testing.T) {
+	handler, _, _, cleanup := newTopicsTestHandler(t, warp.WithVectorStore(nil),
+		warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "qdrant", Failed: true}))
+	defer cleanup()
+	ctx := adminCtx(`{"start_time":"2026-09-01T00:00:00Z","end_time":"2026-09-02T00:00:00Z"}`)
+	handler.startTopics(ctx)
+	require.Equal(t, fasthttp.StatusServiceUnavailable, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+	body := string(ctx.Response.Body())
+	require.Contains(t, body, string(schemas.WarpUnavailableNoVectorStore))
+	require.Contains(t, body, "Warp's own vector store (warp.vector_store in config.json) could not be reached")
+}
+
+// A backfill still pending or running from the store Warp used before is
+// shown, not hidden: it still holds the slot, so a new run cannot start until
+// it ends, and the page has to say why. It ends fast: the job refuses to run
+// into a store other than the one its checkpoint names.
+func TestWarpBackfillStatusShowsAnInFlightJobFromAnotherVectorStore(t *testing.T) {
+	handler, jobs, cleanup := newBackfillTestHandler(t, warp.WithVectorStoreSource(warp.VectorStoreSource{Dedicated: true, Type: "qdrant"}))
+	defer cleanup()
+	jobs.inFlight = &tables.TableSidekiqJob{ID: "job-old-store", Kind: warp.BackfillJobKind, Status: tables.SidekiqStatusRunning, Metadata: `{"vector_store":"old","config_signature":"x"}`}
+
+	statusCtx := adminCtx("")
+	handler.backfillStatus(statusCtx)
+	require.Equal(t, fasthttp.StatusOK, statusCtx.Response.StatusCode())
+	require.Contains(t, string(statusCtx.Response.Body()), "job-old-store", "the run that blocks a new one is shown")
 }

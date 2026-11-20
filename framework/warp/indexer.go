@@ -80,6 +80,7 @@ type LogIndexer struct {
 	ensureMu         sync.Mutex
 	ensuredNamespace string
 	ensuredDimension int
+	markerLock       storeMarkerLock // from the Service, see ensureStoreMarker
 	// drainBudget is how long Close lets accepted work finish before cancelling
 	// it. A field rather than a constant so a test can pick a short one without
 	// waiting out the production value.
@@ -291,7 +292,7 @@ func (i *LogIndexer) ensureNamespaceOnce(ctx context.Context, namespace string, 
 	if i.ensuredNamespace == namespace && i.ensuredDimension == dimension {
 		return nil
 	}
-	if _, err := ensureWarpNamespace(ctx, i.vectors, namespace, dimension); err != nil {
+	if _, err := ensureWarpNamespace(ctx, i.vectors, namespace, dimension, i.markerLock); err != nil {
 		return err
 	}
 	i.ensuredNamespace, i.ensuredDimension = namespace, dimension
@@ -360,7 +361,7 @@ func (i *LogIndexer) warnf(format string, args ...any) {
 // created is empty and referenced by nothing, so removing it is safe, while one
 // that already existed may hold vectors a previous configuration still indexes
 // and must be left alone.
-func ensureWarpNamespace(ctx context.Context, store vectorstore.VectorStore, namespace string, dimension int) (bool, error) {
+func ensureWarpNamespace(ctx context.Context, store vectorstore.VectorStore, namespace string, dimension int, lock storeMarkerLock) (bool, error) {
 	if store == nil {
 		return false, ErrNoVectorStore
 	}
@@ -376,28 +377,39 @@ func ensureWarpNamespace(ctx context.Context, store vectorstore.VectorStore, nam
 		return false, fmt.Errorf("could not check for existing vector namespace: %w", err)
 	}
 	created := !slices.Contains(existing, namespace)
-	return created, store.CreateNamespace(ctx, namespace, dimension, map[string]vectorstore.VectorStoreProperties{
-		"log_id":            {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Bifrost log ID"},
-		"timestamp":         {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Log timestamp in Unix seconds"},
-		"object":            {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Bifrost request type"},
-		"provider":          {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Serving provider"},
-		"model":             {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Serving model"},
-		"status":            {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Terminal log status"},
-		"latency_ms":        {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "End-to-end latency rounded to milliseconds"},
-		"cost_micro_usd":    {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Request cost in millionths of a US dollar"},
-		"prompt_tokens":     {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Input token count"},
-		"completion_tokens": {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Output token count"},
-		"total_tokens":      {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Total token count"},
-		"parent_request_id": {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Fallback or session parent"},
-		"session_id":        {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Bifrost session the request belongs to"},
-		"app":               {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Detected client app"},
-		"virtual_key_id":    {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Virtual key ID"},
-		"user_id":           {DataType: vectorstore.VectorStorePropertyTypeString, Description: "User ID"},
-		"team_ids":          {DataType: vectorstore.VectorStorePropertyTypeStringArray, Description: "Team IDs"},
-		"customer_ids":      {DataType: vectorstore.VectorStorePropertyTypeStringArray, Description: "Customer IDs"},
-		"business_unit_ids": {DataType: vectorstore.VectorStorePropertyTypeStringArray, Description: "Business unit IDs"},
-		"warp_log":          {DataType: vectorstore.VectorStorePropertyTypeBoolean, Description: "Owned by Warp log search"},
-	})
+	if err := store.CreateNamespace(ctx, namespace, dimension, warpNamespaceProperties); err != nil {
+		return created, err
+	}
+	// The marker that says which store this is (see storemarker.go). Best effort:
+	// a store that will not take it (a Weaviate class from before it, with
+	// auto-schema off) still indexes, and storeID tries again and says so.
+	_ = ensureStoreMarker(ctx, store, namespace, dimension, lock)
+	return created, nil
+}
+
+// warpNamespaceProperties is the schema of a Warp log namespace.
+var warpNamespaceProperties = map[string]vectorstore.VectorStoreProperties{
+	"log_id":            {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Bifrost log ID"},
+	"timestamp":         {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Log timestamp in Unix seconds"},
+	"object":            {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Bifrost request type"},
+	"provider":          {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Serving provider"},
+	"model":             {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Serving model"},
+	"status":            {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Terminal log status"},
+	"latency_ms":        {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "End-to-end latency rounded to milliseconds"},
+	"cost_micro_usd":    {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Request cost in millionths of a US dollar"},
+	"prompt_tokens":     {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Input token count"},
+	"completion_tokens": {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Output token count"},
+	"total_tokens":      {DataType: vectorstore.VectorStorePropertyTypeInteger, Description: "Total token count"},
+	"parent_request_id": {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Fallback or session parent"},
+	"session_id":        {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Bifrost session the request belongs to"},
+	"app":               {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Detected client app"},
+	"virtual_key_id":    {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Virtual key ID"},
+	"user_id":           {DataType: vectorstore.VectorStorePropertyTypeString, Description: "User ID"},
+	"team_ids":          {DataType: vectorstore.VectorStorePropertyTypeStringArray, Description: "Team IDs"},
+	"customer_ids":      {DataType: vectorstore.VectorStorePropertyTypeStringArray, Description: "Customer IDs"},
+	"business_unit_ids": {DataType: vectorstore.VectorStorePropertyTypeStringArray, Description: "Business unit IDs"},
+	"warp_log":          {DataType: vectorstore.VectorStorePropertyTypeBoolean, Description: "Owned by Warp log search"},
+	warpStoreIDProperty: {DataType: vectorstore.VectorStorePropertyTypeString, Description: "Store ID on Warp's store marker"},
 }
 
 func generateWarpEmbedding(ctx context.Context, executor EmbeddingExecutor, config *schemas.WarpConfig, text string) ([]float32, *schemas.BifrostLLMUsage, error) {

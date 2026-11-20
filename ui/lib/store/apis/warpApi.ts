@@ -5,6 +5,7 @@ import type {
 	WarpConfigInput,
 	WarpConversation,
 	WarpConversationDetail,
+	WarpLeftBehindIndexResponse,
 	WarpLogIndexStatus,
 } from "@/lib/types/warp";
 import { baseApi } from "./baseApi";
@@ -30,6 +31,17 @@ export const warpApi = baseApi.injectEndpoints({
 		}),
 		cancelWarpBackfill: builder.mutation<WarpBackfillStatus, { id?: string } | void>({
 			query: (body) => ({ url: "/warp/log-index/backfill/cancel", method: "POST", body: body ?? {} }),
+		}),
+		// The log index Warp left in the shared store after moving to its own. A
+		// tag of its own: deleting it refetches this, never the settings form's
+		// config, so a draft in progress is untouched.
+		getWarpLeftBehindIndex: builder.query<WarpLeftBehindIndexResponse, void>({
+			query: () => ({ url: "/warp/log-index/backfill/left-behind" }),
+			providesTags: ["WarpLeftBehindIndex"],
+		}),
+		deleteWarpLeftBehindIndex: builder.mutation<WarpLeftBehindIndexResponse, void>({
+			query: () => ({ url: "/warp/log-index/backfill/left-behind/delete", method: "POST" }),
+			invalidatesTags: ["WarpLeftBehindIndex"],
 		}),
 		// Topic clustering: the same job shape as the backfill, over the vectors
 		// the backfill and live indexing wrote.
@@ -71,6 +83,8 @@ export const {
 	useStartWarpBackfillMutation,
 	useGetWarpBackfillStatusQuery,
 	useCancelWarpBackfillMutation,
+	useGetWarpLeftBehindIndexQuery,
+	useDeleteWarpLeftBehindIndexMutation,
 	useStartWarpTopicsMutation,
 	useGetWarpTopicsStatusQuery,
 	useCancelWarpTopicsMutation,

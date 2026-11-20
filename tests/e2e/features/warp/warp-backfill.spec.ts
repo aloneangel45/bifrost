@@ -49,7 +49,7 @@ async function acknowledgeMCPNotice(page: Page) {
 // The warp flag is shared server state that other suites toggle in parallel,
 // and it only gates the UI. Turning it on in this page's view of the flags
 // leaves the server's copy alone, so no suite races another over it.
-async function mockWarpBackfill(page: Page, job: object) {
+async function mockWarpBackfill(page: Page, job: object, config: object = configuredWarp) {
   await acknowledgeMCPNotice(page)
   await page.route('**/api/feature-flags', async (route) => {
     if (route.request().method() !== 'GET') return route.continue()
@@ -59,7 +59,7 @@ async function mockWarpBackfill(page: Page, job: object) {
     await route.fulfill({ response, json: body })
   })
   await page.route('**/api/warp/config', (route) =>
-    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(configuredWarp) }),
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(config) }),
   )
   await page.route('**/api/warp/log-index/backfill/status**', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(job) }),
@@ -207,5 +207,143 @@ test.describe('Warp semantic search threshold', () => {
     threshold = 0.62
     await page.reload()
     await expect(page.getByTestId('warp-search-threshold-input')).toHaveValue('0.62')
+  })
+})
+
+// warp.vector_store in config.json gives Warp its own store. The page names it,
+// says a new or moved store needs a backfill, and when it could not be reached
+// at startup says exactly that instead of the generic "connect a vector store".
+// The config endpoint is mocked: the store is only set at startup.
+test.describe("Warp's own vector store", () => {
+  const idle = { status: 'idle' }
+
+  test('names a connected dedicated store and points at the backfill', async ({ page }) => {
+    await mockWarpBackfill(page, idle, { ...configuredWarp, vector_store_dedicated: true, vector_store_type: 'qdrant' })
+    await page.goto('/workspace/config/warp')
+
+    await expect(page.getByTestId('warp-vector-store-status')).toHaveText("Warp's own qdrant store connected")
+    await expect(page.getByTestId('warp-dedicated-vector-store-note')).toContainText('start a backfill')
+    await expect(page.getByTestId('warp-vector-store-required')).toHaveCount(0)
+  })
+
+  test('says why Warp is unavailable when its own store failed at startup', async ({ page }) => {
+    await mockWarpBackfill(page, idle, {
+      ...configuredWarp,
+      enabled: false,
+      vector_store_connected: false,
+      vector_store_dedicated: true,
+      vector_store_type: 'qdrant',
+      vector_store_failed: true,
+    })
+    await page.goto('/workspace/config/warp')
+
+    await expect(page.getByTestId('warp-vector-store-required')).toContainText('warp.vector_store in config.json')
+    await expect(page.getByTestId('warp-vector-store-status')).toHaveText("Warp's own vector store unavailable")
+    await expect(page.getByTestId('warp-dedicated-vector-store-note')).toHaveCount(0)
+  })
+
+  test('keeps the shared-store wording without warp.vector_store', async ({ page }) => {
+    await mockWarpBackfill(page, idle, { ...configuredWarp, vector_store_dedicated: false })
+    await page.goto('/workspace/config/warp')
+
+    await expect(page.getByTestId('warp-vector-store-status')).toHaveText('Vector store connected')
+    await expect(page.getByTestId('warp-dedicated-vector-store-note')).toHaveCount(0)
+    await expect(page.getByTestId('warp-shared-vector-store-note')).toContainText('Optionally, give Warp its own')
+  })
+})
+
+// Warp's own store leaves the index it built in the shared store behind. The
+// server works out whether there is one from the stores on each read, and the
+// settings page offers to delete it. The leftover has its own endpoint, so a
+// delete refetches only that, never the config the settings form is drafted
+// from.
+test.describe("Warp's index left in the shared store", () => {
+  const idle = { status: 'idle' }
+  const dedicated = { ...configuredWarp, vector_store_dedicated: true, vector_store_type: 'qdrant' }
+
+  // Every call is recorded: config reads and writes, so a test can see that a
+  // cleanup neither refetched nor saved the settings, and the leftover calls.
+  // failures is how many leftover reads answer 503 before the store answers.
+  async function mockLeftover(page: Page, config: object, namespace: string | null, failures = 0) {
+    let leftover = namespace
+    let failing = failures
+    const calls: string[] = []
+    await mockWarpBackfill(page, idle, config)
+    await page.route('**/api/warp/config', (route) => {
+      calls.push(`${route.request().method()} /api/warp/config`)
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(config) })
+    })
+    await page.route('**/api/warp/log-index/backfill/left-behind**', (route) => {
+      const url = new URL(route.request().url())
+      calls.push(`${route.request().method()} ${url.pathname}`)
+      if (route.request().method() === 'POST') leftover = null
+      if (route.request().method() === 'GET' && failing > 0) {
+        failing--
+        return route.fulfill({
+          status: 503,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: { message: 'shared vector store unavailable' } }),
+        })
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ left_behind: leftover ? { namespace: leftover } : null }),
+      })
+    })
+    return calls
+  }
+
+  test('deletes the index left in the shared store after confirming', async ({ page }) => {
+    const calls = await mockLeftover(page, dedicated, 'BifrostWarpLogs')
+    await page.goto('/workspace/config/warp')
+
+    const notice = page.getByTestId('warp-left-behind-index-shared')
+    await expect(notice).toContainText('still in the shared vector store (namespace BifrostWarpLogs)')
+    const maxIterations = page.getByTestId('warp-max-iterations-input')
+    await maxIterations.fill('15') // a draft in progress
+
+    await notice.getByTestId('warp-left-behind-index-delete-button').click()
+    await expect(page.getByRole('alertdialog')).toContainText('every Bifrost replica runs with warp.vector_store')
+    await page.getByTestId('warp-left-behind-index-cancel-button').click()
+    expect(calls.filter((call) => call.startsWith('POST'))).toEqual([])
+
+    const configReads = calls.filter((call) => call === 'GET /api/warp/config').length
+    await notice.getByTestId('warp-left-behind-index-delete-button').click()
+    await page.getByTestId('warp-left-behind-index-confirm-button').click()
+    await expect(page.getByTestId('warp-left-behind-index-shared')).toHaveCount(0)
+    expect(calls).toContain('POST /api/warp/log-index/backfill/left-behind/delete')
+    expect(calls.filter((call) => call === 'GET /api/warp/config').length, 'the config is not refetched').toBe(configReads)
+    expect(calls, 'nor saved').not.toContain('PUT /api/warp/config')
+    await expect(maxIterations, 'the draft is untouched').toHaveValue('15')
+  })
+
+  // A check that failed is not "nothing left behind": it says so, and a retry
+  // asks again.
+  test('says when the check failed and retries it', async ({ page }) => {
+    await mockLeftover(page, dedicated, 'BifrostWarpLogs', 1)
+    await page.goto('/workspace/config/warp')
+
+    const failed = page.getByTestId('warp-left-behind-index-error')
+    await expect(failed).toContainText("Couldn't check the shared vector store")
+    await expect(page.getByTestId('warp-left-behind-index-shared')).toHaveCount(0)
+    await failed.getByTestId('warp-left-behind-index-retry-button').click()
+    await expect(page.getByTestId('warp-left-behind-index-shared')).toContainText('namespace BifrostWarpLogs')
+    await expect(failed).toHaveCount(0)
+  })
+
+  test('shows nothing when the shared store holds no old index', async ({ page }) => {
+    await mockLeftover(page, dedicated, null)
+    await page.goto('/workspace/config/warp')
+    await expect(page.getByTestId('warp-dedicated-vector-store-note')).toBeVisible()
+    await expect(page.getByTestId('warp-left-behind-index-shared')).toHaveCount(0)
+  })
+
+  test('does not ask while Warp is on the shared store', async ({ page }) => {
+    const calls = await mockLeftover(page, { ...configuredWarp, vector_store_dedicated: false }, 'BifrostWarpLogs')
+    await page.goto('/workspace/config/warp')
+    await expect(page.getByTestId('warp-shared-vector-store-note')).toBeVisible()
+    await expect(page.getByTestId('warp-left-behind-index-shared')).toHaveCount(0)
+    expect(calls.filter((call) => call.includes('left-behind'))).toEqual([])
   })
 })

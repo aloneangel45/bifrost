@@ -117613,7 +117613,7 @@
             }
           },
           "503": {
-            "description": "The backfill job store is unavailable. This route does not need the job\nrunner: it only reads job state.\n"
+            "description": "The backfill job store is unavailable, or, with no job in flight,\nWarp's vector store could not be asked which store it is, so whether\nthe latest backfill indexed it cannot be told. This route does not\nneed the job runner: it only reads job state.\n"
           }
         }
       }
@@ -117692,6 +117692,139 @@
           },
           "503": {
             "description": "The background job runner or the backfill job store is unavailable.\nCancelling needs both: the runner to stop the work, the store to record\nit.\n"
+          }
+        }
+      }
+    },
+    "/api/warp/log-index/backfill/left-behind": {
+      "get": {
+        "operationId": "getWarpLeftBehindIndex",
+        "summary": "Read the Warp log index left in the shared vector store",
+        "description": "When Warp uses a store of its own (`warp.vector_store`), the log index it\nbuilt in the shared vector store before stays there. This reports it,\nworked out from the stores on each call: the shared store still holds\nWarp's namespace, and that namespace is not the one Warp writes to now.\n`left_behind` is null when there is none, including while Warp uses the\nshared store.\n\nAdministrators only: the local admin in OSS, `Warp` Update in enterprise.\n",
+        "tags": [
+          "Warp"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The leftover index, or null",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "left_behind": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "description": "Warp's log index left in the shared vector store after it moved to a store of its own.",
+                          "properties": {
+                            "namespace": {
+                              "type": "string",
+                              "description": "The shared store's namespace holding the index."
+                            }
+                          },
+                          "required": [
+                            "namespace"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "left_behind"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not the local admin (OSS) and lacks `Warp` Update (enterprise)"
+          },
+          "503": {
+            "description": "The shared vector store could not be checked."
+          }
+        }
+      }
+    },
+    "/api/warp/log-index/backfill/left-behind/delete": {
+      "post": {
+        "operationId": "deleteWarpLeftBehindIndex",
+        "summary": "Delete the Warp log index left in the shared vector store",
+        "description": "Deletes Warp's namespace from the shared vector store, after checking\nagain that it is a leftover and not the index Warp writes to now. With\nseveral replicas, call it only once every replica runs with\n`warp.vector_store`.\n\nAdministrators only: the local admin in OSS, `Warp` Update in enterprise.\n",
+        "tags": [
+          "Warp"
+        ],
+        "security": [
+          {
+            "ManagementBearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted; there is no leftover now",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "left_behind": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "description": "Warp's log index left in the shared vector store after it moved to a store of its own.",
+                          "properties": {
+                            "namespace": {
+                              "type": "string",
+                              "description": "The shared store's namespace holding the index."
+                            }
+                          },
+                          "required": [
+                            "namespace"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "left_behind"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Caller is not the local admin (OSS) and lacks `Warp` Update (enterprise)"
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
           }
         }
       }
@@ -161348,7 +161481,22 @@
           "vector_store_connected": {
             "type": "boolean",
             "readOnly": true,
-            "description": "Whether the shared runtime vector store is connected."
+            "description": "Whether Warp's vector store is connected - its own store when vector_store_dedicated, otherwise the shared runtime vector store."
+          },
+          "vector_store_dedicated": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "Whether Warp has its own vector store (warp.vector_store in config.json) rather than the shared one."
+          },
+          "vector_store_type": {
+            "type": "string",
+            "readOnly": true,
+            "description": "Type of Warp's own vector store, when vector_store_dedicated."
+          },
+          "vector_store_failed": {
+            "type": "boolean",
+            "readOnly": true,
+            "description": "Warp's own vector store could not be reached at startup, so Warp is unavailable until it is fixed and Bifrost restarts. Absent otherwise."
           }
         },
         "required": [
@@ -161366,7 +161514,8 @@
           "semantic_search_threshold",
           "semantic_search_limit",
           "topic_discovery_min_requests",
-          "vector_store_connected"
+          "vector_store_connected",
+          "vector_store_dedicated"
         ]
       },
       "WarpConfigInput": {

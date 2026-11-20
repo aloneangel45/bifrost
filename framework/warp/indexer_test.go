@@ -111,8 +111,17 @@ func (f *fakeWarpVectorStore) ListNamespaces(context.Context, string) ([]string,
 	}
 	return append([]string(nil), f.existing...), nil
 }
-func (f *fakeWarpVectorStore) GetChunk(context.Context, string, string) (vectorstore.SearchResult, error) {
-	return vectorstore.SearchResult{}, nil
+
+// GetChunk answers from what was stored, as the real stores do: Warp reads its
+// store marker this way.
+func (f *fakeWarpVectorStore) GetChunk(_ context.Context, namespace string, id string) (vectorstore.SearchResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	metadata, ok := f.adds[fakeVectorKey{namespace, id}]
+	if !ok {
+		return vectorstore.SearchResult{}, fmt.Errorf("%w: %s", vectorstore.ErrNotFound, id)
+	}
+	return vectorstore.SearchResult{ID: id, Properties: metadata}, nil
 }
 func (f *fakeWarpVectorStore) GetChunks(context.Context, string, []string) ([]vectorstore.SearchResult, error) {
 	return nil, nil
@@ -269,12 +278,13 @@ func fakeMatchesAll(metadata map[string]interface{}, queries []vectorstore.Query
 }
 
 // idsIn lists the ids stored under a namespace, sorted.
+// idsIn lists the log entries in a namespace: Warp's store marker is not one.
 func (f *fakeWarpVectorStore) idsIn(namespace string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ids := []string{}
 	for key := range f.adds {
-		if key.namespace == namespace {
+		if key.namespace == namespace && key.id != warpStoreMarkerID {
 			ids = append(ids, key.id)
 		}
 	}
@@ -563,7 +573,7 @@ func TestWarpEnsureNamespacePropagatesDiscoveryErrors(t *testing.T) {
 	vectors := newFakeWarpVectorStore()
 	vectors.listErr = fmt.Errorf("list exploded")
 
-	created, err := ensureWarpNamespace(context.Background(), vectors, "ns", 8)
+	created, err := ensureWarpNamespace(context.Background(), vectors, "ns", 8, nil)
 	require.Error(t, err)
 	require.False(t, created)
 	require.Zero(t, vectors.createCalls, "an unlistable store must not be written to with unknown ownership")

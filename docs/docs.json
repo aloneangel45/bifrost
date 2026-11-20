@@ -1634,6 +1634,8 @@
                   "POST /api/warp/log-index/backfill",
                   "GET /api/warp/log-index/backfill/status",
                   "POST /api/warp/log-index/backfill/cancel",
+                  "GET /api/warp/log-index/backfill/left-behind",
+                  "POST /api/warp/log-index/backfill/left-behind/delete",
                   "POST /api/warp/log-index/topics",
                   "GET /api/warp/log-index/topics/status",
                   "POST /api/warp/log-index/topics/cancel",

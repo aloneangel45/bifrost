@@ -2511,7 +2511,7 @@ func TestWarpTopicsJobAgainstLiveVectorStores(t *testing.T) {
 			row.LogVectorStoreNamespace = namespace
 			config := configFromRow(row)
 			t.Cleanup(func() { _ = store.DeleteNamespace(context.Background(), namespace) })
-			_, err = ensureWarpNamespace(ctx, store, namespace, config.EmbeddingDimension)
+			_, err = ensureWarpNamespace(ctx, store, namespace, config.EmbeddingDimension, nil)
 			require.NoError(t, err)
 
 			start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)

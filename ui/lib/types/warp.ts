@@ -62,6 +62,12 @@ export interface WarpConfig {
 	/** How many requests that matched no topic start a discovery of new topics. */
 	topic_discovery_min_requests: number;
 	vector_store_connected: boolean;
+	/** Whether Warp has its own vector store (warp.vector_store in config.json) rather than the shared one. */
+	vector_store_dedicated: boolean;
+	/** Type of Warp's own vector store, when vector_store_dedicated. */
+	vector_store_type?: string;
+	/** Warp's own vector store could not be reached at startup, so Warp is unavailable until it is fixed and Bifrost restarts. */
+	vector_store_failed?: boolean;
 	/** Whether the gateway's Bifrost MCP is loaded. While bifrost_mcp_enabled, Warp does not answer without it. */
 	bifrost_mcp_available: boolean;
 	/** Whether Warp uses the Bifrost MCP at all. Off for now: no setup step, no management tools section. */
@@ -263,4 +269,13 @@ export interface WarpLogIndexStatus {
 	 * model has no topics; absent when the vector store cannot say.
 	 */
 	has_indexed_requests?: boolean;
+}
+/** The log index Warp left in the shared vector store after moving to a store of its own. */
+export interface WarpLeftBehindIndex {
+	namespace: string;
+}
+
+/** GET /api/warp/log-index/backfill/left-behind: the leftover, or null when there is none. */
+export interface WarpLeftBehindIndexResponse {
+	left_behind: WarpLeftBehindIndex | null;
 }

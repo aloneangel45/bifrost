@@ -34,7 +34,7 @@ func retentionTestService(t *testing.T) (*Service, *fakeWarpVectorStore) {
 		require.NoError(t, err)
 		require.Equal(t, IndexOutcomeIndexed, outcome)
 	}
-	require.Len(t, vectors.adds, 2)
+	require.Len(t, retentionTestIDs(vectors), 2)
 	return service, vectors
 }
 
@@ -72,7 +72,7 @@ func TestWarpSweepsVectorsOfExpiredLogs(t *testing.T) {
 	swept, err := service.sweepExpiredVectors(context.Background(), now)
 	require.NoError(t, err)
 	require.Zero(t, swept, "no retention, no sweep")
-	require.Len(t, vectors.adds, 2)
+	require.Len(t, retentionTestIDs(vectors), 2)
 
 	days := 0
 	service.SetVectorRetention(func() int { return days })

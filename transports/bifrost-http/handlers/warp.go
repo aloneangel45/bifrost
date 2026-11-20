@@ -131,11 +131,13 @@ func warpVirtualKeyDecorator(store vkModelConfigReader, resolvers WarpResolvers)
 // because the flag can be switched on at runtime and routes are only
 // registered once; what the flag withholds is every route and the indexing of
 // new logs.
-func NewWarpHandler(store configstore.ConfigStore, loggerPlugin *logging.LoggerPlugin, client *bifrost.Bifrost, logsStore logstore.LogStore, vectors vectorstore.VectorStore, runner *sidekiq.Runner, catalog *modelcatalog.ModelCatalog, logger schemas.Logger, enabled func() bool, resolvers WarpResolvers) *WarpHandler {
-	opts := []warp.Option{warp.WithLogger(logger), warp.WithModelCatalog(catalog), warp.WithVectorStore(vectors)}
+func NewWarpHandler(store configstore.ConfigStore, loggerPlugin *logging.LoggerPlugin, client *bifrost.Bifrost, logsStore logstore.LogStore, vectors vectorstore.VectorStore, vectorSource warp.VectorStoreSource, sharedVectors vectorstore.VectorStore, runner *sidekiq.Runner, catalog *modelcatalog.ModelCatalog, logger schemas.Logger, enabled func() bool, resolvers WarpResolvers) *WarpHandler {
+	opts := []warp.Option{warp.WithLogger(logger), warp.WithModelCatalog(catalog), warp.WithVectorStore(vectors), warp.WithVectorStoreSource(vectorSource)}
 	if store != nil {
 		opts = append(opts, warp.WithVirtualKeyDecorator(warpVirtualKeyDecorator(store, resolvers)))
 	}
+	// For the log index Warp left in the shared store after moving to its own.
+	opts = append(opts, warp.WithSharedVectorStore(sharedVectors))
 	if resolvers.UserGovernance != nil {
 		opts = append(opts, warp.WithUserGovernanceReader(resolvers.UserGovernance))
 	}
@@ -248,6 +250,11 @@ func (h *WarpHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.Bi
 	// not admin-gated: whether semantic search is usable is something everyone
 	// who can ask Warp a question needs to see.
 	r.GET("/api/warp/log-index/status", lib.ChainMiddlewares(h.gated(h.logIndexStatus), middlewares...))
+	// The log index Warp left in the shared store. Under backfill so enterprise
+	// RBAC asks for Warp Update, as for a backfill: deleting an index is no
+	// chat-panel read.
+	r.GET("/api/warp/log-index/backfill/left-behind", lib.ChainMiddlewares(h.gated(h.getLeftoverIndex), middlewares...))
+	r.POST("/api/warp/log-index/backfill/left-behind/delete", lib.ChainMiddlewares(h.gated(h.deleteLeftoverIndex), middlewares...))
 
 	// Registered unconditionally, and 503 while Warp cannot answer.
 	//
@@ -422,7 +429,13 @@ func (h *WarpHandler) startJob(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 	case errors.Is(err, warp.ErrTopicsAlreadyBuilt):
 		SendError(ctx, fasthttp.StatusConflict, err.Error())
 		return
-	case errors.Is(err, warp.ErrUnavailable), errors.Is(err, warp.ErrNoVectorStore):
+	case errors.Is(err, warp.ErrDedicatedVectorStoreFailed):
+		h.sendUnavailable(ctx, schemas.WarpUnavailableNoVectorStore, warpDedicatedVectorStoreFailedMsg)
+		return
+	case errors.Is(err, warp.ErrNoVectorStore):
+		h.sendUnavailable(ctx, schemas.WarpUnavailableNoVectorStore, err.Error())
+		return
+	case errors.Is(err, warp.ErrUnavailable):
 		SendError(ctx, fasthttp.StatusServiceUnavailable, err.Error())
 		return
 	case err != nil:
@@ -471,6 +484,9 @@ func (h *WarpHandler) jobStatus(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 	if id != "" {
 		job, err = h.backfillStore.GetSidekiqJob(ctx, id)
 	} else {
+		// An in-flight job is shown whichever store it names: it holds the slot,
+		// so a new run cannot start until it ends, and the page must say why. One
+		// from another store ends fast, refusing to run there (RunBackfillJob).
 		job, err = h.backfillStore.GetInFlightSidekiqJobByKind(ctx, spec.kind)
 		if err == nil && job == nil {
 			// Nothing running. A reloaded page still wants to see how the last
@@ -483,6 +499,21 @@ func (h *WarpHandler) jobStatus(ctx *fasthttp.RequestCtx, spec warpJobSpec) {
 			job, err = h.backfillStore.GetLatestSidekiqJobByKind(ctx, spec.kind)
 			if err == nil && job != nil && !h.service.BackfillMatchesConfig(ctx, job.Metadata) {
 				job = nil
+			}
+			// An embedding backfill that indexed into another store says nothing
+			// about this one: after warp.vector_store is added or moved, the page
+			// offers a fresh backfill instead of showing the old store's run as done.
+			// A store that cannot say which it is gets an answer saying so, not
+			// a run that may be another store's.
+			if err == nil && job != nil && spec.kind == warp.BackfillJobKind {
+				matches, checkErr := h.service.BackfillMatchesStore(ctx, job.Metadata)
+				if checkErr != nil {
+					h.sendUnavailable(ctx, schemas.WarpUnavailableNoVectorStore, "Could not identify Warp's vector store: "+checkErr.Error())
+					return
+				}
+				if !matches {
+					job = nil
+				}
 			}
 		}
 	}
@@ -666,6 +697,20 @@ func (h *WarpHandler) logIndexStatus(ctx *fasthttp.RequestCtx) {
 	if job != nil && !warpJobMatchesNamespace(job, view.LogVectorStoreNamespace) {
 		job = nil
 	}
+	// Likewise a job that indexed into another vector store: after
+	// warp.vector_store is added or moved, the new store is empty whatever the
+	// last run said.
+	// One whose store cannot be checked is left out too, as above: the summary
+	// is worth more than an error, and an old store's run is not this one's.
+	if job != nil {
+		matches, checkErr := h.service.BackfillMatchesStore(ctx, job.Metadata)
+		if checkErr != nil {
+			logger.Warn("failed to identify Warp's vector store for index status: %v", checkErr)
+		}
+		if checkErr != nil || !matches {
+			job = nil
+		}
+	}
 	if job != nil {
 		backfill := warpBackfillStatusFromRow(job)
 		// This route has no admin gate, unlike the backfill endpoints. LastError
@@ -756,6 +801,51 @@ func (h *WarpHandler) getConfig(ctx *fasthttp.RequestCtx) {
 	SendJSON(ctx, view)
 }
 
+// warpLeftoverIndex is the settings page's answer: the log index Warp left in
+// the shared store, or null when there is none.
+type warpLeftoverIndex struct {
+	LeftBehind *warp.LeftoverIndex `json:"left_behind"`
+}
+
+// getLeftoverIndex reports the log index Warp left in the shared store, worked
+// out from the stores on each call. Admin-only, as the delete it offers is.
+func (h *WarpHandler) getLeftoverIndex(ctx *fasthttp.RequestCtx) {
+	if !warpAdmin(ctx) {
+		SendError(ctx, fasthttp.StatusForbidden, "Only administrators can configure Warp")
+		return
+	}
+	leftover, err := h.service.SharedStoreLeftover(ctx)
+	if err != nil {
+		logger.Warn("failed to check for Warp's old log index in the shared vector store: %v", err)
+		SendError(ctx, fasthttp.StatusServiceUnavailable, "Could not check the shared vector store for Warp's old log index")
+		return
+	}
+	SendJSON(ctx, warpLeftoverIndex{LeftBehind: leftover})
+}
+
+// deleteLeftoverIndex deletes the log index Warp left in the shared store,
+// after the service checks again that there is one. Admin-only: it removes
+// vectors.
+func (h *WarpHandler) deleteLeftoverIndex(ctx *fasthttp.RequestCtx) {
+	if !warpAdmin(ctx) {
+		SendError(ctx, fasthttp.StatusForbidden, "Only administrators can configure Warp")
+		return
+	}
+	before, _ := h.service.SharedStoreLeftover(ctx)
+	err := h.service.DeleteSharedStoreLeftover(ctx)
+	switch {
+	case errors.Is(err, warp.ErrNoLeftoverIndex):
+		SendError(ctx, fasthttp.StatusNotFound, err.Error())
+		return
+	case err != nil:
+		logger.Warn("failed to delete Warp's old log index from the shared vector store: %v", err)
+		SendError(ctx, fasthttp.StatusInternalServerError, "Failed to delete Warp's old log index")
+		return
+	}
+	lib.RecordAuditChange(ctx, "warp_left_behind_index.deleted", "warp_left_behind_index", "shared", "Warp", before, nil)
+	SendJSON(ctx, warpLeftoverIndex{})
+}
+
 // putConfig is admin-only, on the same reasoning notifications.go applies to
 // publishing: RBAC in this transport is enterprise-only and path-based, so the
 // OSS floor is enforced in the handler. A single PUT plants a credential that
@@ -779,6 +869,9 @@ func (h *WarpHandler) putConfig(ctx *fasthttp.RequestCtx) {
 	switch {
 	case errors.Is(err, warp.ErrUnavailable):
 		SendError(ctx, fasthttp.StatusServiceUnavailable, err.Error())
+		return
+	case errors.Is(err, warp.ErrDedicatedVectorStoreFailed):
+		h.sendUnavailable(ctx, schemas.WarpUnavailableNoVectorStore, warpDedicatedVectorStoreFailedMsg)
 		return
 	case errors.Is(err, warp.ErrNoVectorStore):
 		h.sendUnavailable(ctx, schemas.WarpUnavailableNoVectorStore, err.Error())

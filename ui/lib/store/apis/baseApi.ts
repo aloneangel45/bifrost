@@ -239,6 +239,7 @@ export const baseApi = createApi({
 		"RSSSettings",
 		"SidekiqJobs",
 		"WarpConfig",
+		"WarpLeftBehindIndex",
 		"WarpBackfillStatus",
 		"WarpConversations",
 		"Agents",
